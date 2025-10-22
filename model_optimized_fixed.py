@@ -467,7 +467,7 @@ class SAM(torch.optim.Optimizer):
 
 # ==================== TRAINING FUNCTIONS (FIXED) ====================
 def train_epoch_sam(model, loader, criterion, optimizer, scaler, use_amp):
-    """FIXED: Training loop with SAM optimizer"""
+    """FIXED: Training loop with SAM optimizer and proper GradScaler handling"""
     model.train()
     running_loss = 0.0
 
