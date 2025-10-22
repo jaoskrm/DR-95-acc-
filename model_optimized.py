@@ -517,7 +517,7 @@ def train_epoch_sam(model, loader, criterion, optimizer, scaler, use_amp):
                     loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            # Don't call unscale_ again - just clip and step
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.second_step(zero_grad=True)
             scaler.update()
