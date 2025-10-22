@@ -495,7 +495,7 @@ def train_epoch_sam(model, loader, criterion, optimizer, scaler, use_amp):
 
         # FIXED SAM WORKFLOW WITH AMP
         if use_amp:
-            # First forward-backward pass
+            # First forward-backward pass (no unscaling needed - SAM is scale-invariant)
             with autocast():
                 outputs = model(images)
                 if mixed:
@@ -504,11 +504,10 @@ def train_epoch_sam(model, loader, criterion, optimizer, scaler, use_amp):
                     loss = criterion(outputs, labels)
 
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            # SAM normalizes gradients, so scaling doesn't affect the perturbation direction
             optimizer.first_step(zero_grad=True)
 
-            # Second forward-backward pass
+            # Second forward-backward pass (unscale before second step)
             with autocast():
                 outputs = model(images)
                 if mixed:
