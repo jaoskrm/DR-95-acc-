@@ -188,16 +188,12 @@ test_transform = val_transform
 
 # ==================== CORAL HEAD ====================
 class CoralLayer(nn.Module):
-    """CORAL ordinal regression output layer with numerical stability"""
+    """CORAL ordinal regression output layer"""
     def __init__(self, num_classes):
         super().__init__()
         self.num_classes = num_classes
         self.coral_weights = nn.Linear(512, 1, bias=False)
         self.coral_bias = nn.Parameter(torch.zeros(num_classes - 1).float())
-        
-        # Initialize weights properly
-        nn.init.xavier_uniform_(self.coral_weights.weight)
-        nn.init.constant_(self.coral_bias, 0.0)
 
     def forward(self, x):
         return self.coral_weights(x) + self.coral_bias
@@ -225,13 +221,6 @@ class EfficientNetDR_CORAL(nn.Module):
             self.ordinal_head = CoralLayer(num_classes)
         else:
             self.classifier = nn.Linear(512, num_classes)
-            
-        # Initialize feature head properly
-        for m in self.feature_head.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         features = self.backbone(x)
@@ -336,49 +325,32 @@ class XAIExplainer:
 
 # ==================== CORAL UTILITIES ====================
 def coral_loss(logits, levels):
-    """CORAL ordinal regression loss with numerical stability"""
+    """CORAL ordinal regression loss"""
     batch_size = logits.size(0)
     num_classes = logits.size(1) + 1
 
     levels_expanded = levels.unsqueeze(1).repeat(1, num_classes - 1)
-    thresholds = torch.arange(num_classes - 1, dtype=torch.float32).unsqueeze(0).repeat(batch_size, 1).to(logits.device)
+    thresholds = torch.arange(num_classes - 1).unsqueeze(0).repeat(batch_size, 1).to(logits.device)
 
     targets = (levels_expanded > thresholds).float()
 
-    # Clamp logits to prevent numerical instability
-    logits_clamped = torch.clamp(logits, min=-10, max=10)
-    
-    loss = F.binary_cross_entropy_with_logits(logits_clamped, targets, reduction='mean')
+    loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='mean')
 
     return loss
 
 def coral_predict(logits):
     """Convert CORAL logits to class predictions"""
-    # Clamp logits for stability
-    logits_clamped = torch.clamp(logits, min=-10, max=10)
-    probas = torch.sigmoid(logits_clamped)
+    probas = torch.sigmoid(logits)
     predictions = (probas > 0.5).sum(dim=1)
     return predictions
 
 def coral_to_probs(logits):
-    """Convert CORAL logits to class probabilities with numerical stability"""
-    # Clamp logits for stability
-    logits_clamped = torch.clamp(logits, min=-10, max=10)
-    probas = torch.sigmoid(logits_clamped)
-    
-    # Add boundary probabilities
-    probas_padded = torch.cat([
-        torch.zeros(probas.size(0), 1, device=probas.device),
-        probas,
-        torch.ones(probas.size(0), 1, device=probas.device)
-    ], dim=1)
+    """Convert CORAL logits to class probabilities"""
+    probas = torch.sigmoid(logits)
+    probas = torch.cat([probas, torch.ones(probas.size(0), 1).to(probas.device)], dim=1)
+    probas = torch.cat([torch.ones(probas.size(0), 1).to(probas.device), probas], dim=1)
 
-    # Compute class probabilities
-    class_probs = probas_padded[:, 1:] - probas_padded[:, :-1]
-    
-    # Ensure probabilities are non-negative and sum to 1
-    class_probs = torch.clamp(class_probs, min=1e-8)
-    class_probs = class_probs / class_probs.sum(dim=1, keepdim=True)
+    class_probs = probas[:, 1:] - probas[:, :-1]
 
     return class_probs
 
@@ -397,7 +369,7 @@ def get_class_weights(samples_per_class, beta=0.99999):
 
 # ==================== COMBINED LOSS ====================
 class CombinedOrdinalLoss(nn.Module):
-    """CORAL loss + QWK loss with class balancing - numerically stable"""
+    """CORAL loss + QWK loss with class balancing"""
     def __init__(self, num_classes=5, class_weights=None, alpha=0.7):
         super().__init__()
         self.num_classes = num_classes
@@ -408,59 +380,29 @@ class CombinedOrdinalLoss(nn.Module):
         for i in range(num_classes):
             for j in range(num_classes):
                 w[i, j] = (i - j)**2 / (num_classes - 1)**2
-        self.w = torch.from_numpy(w).float()
+        self.w = torch.from_numpy(w).float().to(DEVICE)
 
     def forward(self, logits, targets):
         targets = targets.long()
-        device = logits.device
-        
-        # Move weight matrix to device if needed
-        if self.w.device != device:
-            self.w = self.w.to(device)
 
-        # CORAL loss
         coral_loss_value = coral_loss(logits, targets)
 
-        # Apply class weights if provided
         if self.class_weights is not None:
-            if self.class_weights.device != device:
-                self.class_weights = self.class_weights.to(device)
             weights_batch = self.class_weights[targets]
-            coral_loss_value = coral_loss_value * weights_batch.mean()
+            coral_loss_value = (coral_loss_value * weights_batch.mean())
 
-        # QWK loss with numerical stability
-        try:
-            probs = coral_to_probs(logits)
-            
-            # Ensure probs and targets are valid
-            if torch.isnan(probs).any() or torch.isinf(probs).any():
-                print("Warning: NaN/Inf in probabilities, using CORAL loss only")
-                return coral_loss_value
-            
-            O = torch.matmul(probs.T, F.one_hot(targets, self.num_classes).float())
-            O = O / (O.sum() + 1e-8)
-            
-            pred_hist = probs.sum(0, keepdim=True)
-            true_hist = F.one_hot(targets, self.num_classes).float().sum(0, keepdim=True)
-            E = torch.matmul(true_hist.T, pred_hist)
-            E = E / (E.sum() + 1e-8)
-            
-            num = (self.w * O).sum()
-            den = (self.w * E).sum()
-            qwk_loss = 1 - (1 - num) / (1 - den + 1e-8)
-            
-            # Check for numerical issues
-            if torch.isnan(qwk_loss) or torch.isinf(qwk_loss):
-                print("Warning: NaN/Inf in QWK loss, using CORAL loss only")
-                return coral_loss_value
-                
-            total_loss = self.alpha * coral_loss_value + (1 - self.alpha) * qwk_loss
-            
-        except Exception as e:
-            print(f"Warning: Error in QWK loss computation: {e}, using CORAL loss only")
-            total_loss = coral_loss_value
+        probs = coral_to_probs(logits)
+        O = torch.matmul(probs.T, F.one_hot(targets, self.num_classes).float())
+        O = O / (O.sum() + 1e-8)
+        pred_hist = probs.sum(0, keepdim=True)
+        true_hist = F.one_hot(targets, self.num_classes).float().sum(0, keepdim=True)
+        E = torch.matmul(true_hist.T, pred_hist)
+        E = E / (E.sum() + 1e-8)
+        num = (self.w * O).sum()
+        den = (self.w * E).sum()
+        qwk_loss = 1 - (1 - num) / (1 - den + 1e-8)
 
-        return total_loss
+        return self.alpha * coral_loss_value + (1 - self.alpha) * qwk_loss
 
 # ==================== SAM OPTIMIZER (FIXED) ====================
 class SAM(torch.optim.Optimizer):
@@ -525,7 +467,7 @@ class SAM(torch.optim.Optimizer):
 
 # ==================== TRAINING FUNCTIONS (FIXED) ====================
 def train_epoch_sam(model, loader, criterion, optimizer, scaler, use_amp):
-    """FIXED: Training loop with SAM optimizer"""
+    """FIXED: Training loop with SAM optimizer and proper GradScaler handling"""
     model.train()
     running_loss = 0.0
 
@@ -551,28 +493,54 @@ def train_epoch_sam(model, loader, criterion, optimizer, scaler, use_amp):
                 images, labels_a, labels_b, lam = cutmix_data(images, labels, CUTMIX_ALPHA)
                 mixed = True
 
-        # SAM WITHOUT AMP (to avoid GradScaler conflicts)
-        # First forward-backward pass
-        outputs = model(images)
-        if mixed:
-            loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
-        else:
-            loss = criterion(outputs, labels)
-            
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.first_step(zero_grad=True)
+        # FIXED SAM WORKFLOW WITH AMP
+        if use_amp:
+            # First forward-backward pass
+            with autocast():
+                outputs = model(images)
+                if mixed:
+                    loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+                else:
+                    loss = criterion(outputs, labels)
 
-        # Second forward-backward pass
-        outputs = model(images)
-        if mixed:
-            loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.first_step(zero_grad=True)
+            scaler.update()  # Update scaler after first step
+
+            # Second forward-backward pass (create new scaler state)
+            with autocast():
+                outputs = model(images)
+                if mixed:
+                    loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+                else:
+                    loss = criterion(outputs, labels)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.second_step(zero_grad=True)
+            scaler.update()  # Update scaler after second step
         else:
-            loss = criterion(outputs, labels)
-            
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.second_step(zero_grad=True)
+            # CPU fallback
+            outputs = model(images)
+            if mixed:
+                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            else:
+                loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.first_step(zero_grad=True)
+
+            outputs = model(images)
+            if mixed:
+                loss = lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+            else:
+                loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.second_step(zero_grad=True)
 
         running_loss += loss.item()
 
@@ -901,13 +869,12 @@ def main():
     print(f"Epochs: {EPOCHS}")
     print(f"Device: {DEVICE}")
     print(f"\nOptimizations:")
-    print(f"  • SAM: {USE_SAM} (without AMP to avoid conflicts)")
+    print(f"  • SAM: {USE_SAM} (FIXED GradScaler workflow)")
     print(f"  • SWA: {USE_SWA} (start epoch {SWA_START_EPOCH})")
-    print(f"  • CORAL ordinal: {USE_CORAL} (numerically stable)")
+    print(f"  • CORAL ordinal: {USE_CORAL}")
     print(f"  • Class-balanced loss: {USE_CLASS_BALANCED}")
     print(f"  • Mixup: {USE_MIXUP} (α={MIXUP_ALPHA})")
     print(f"  • CutMix: {USE_CUTMIX} (α={CUTMIX_ALPHA})")
-    print(f"  • AMP: {use_amp} (disabled for SAM)")
 
     # Initialize model
     print("\n✓ Using EfficientNet-B3 + CORAL")
@@ -958,8 +925,7 @@ def main():
             swa_lr=SWA_LR
         )
 
-    # Use AMP only for standard optimizer, not SAM
-    use_amp = torch.cuda.is_available() and not USE_SAM
+    use_amp = torch.cuda.is_available()
     scaler = GradScaler() if use_amp else None
 
     best_qwk = 0
